@@ -31,6 +31,7 @@
 
 import io
 import re
+import time
 import difflib
 import zipfile
 import concurrent.futures
@@ -260,18 +261,22 @@ def resolve_company(user_input: str, corp_map: dict, norm_index: dict):
     return None, None, None
 
 
-@st.cache_data(ttl=60 * 60 * 24 * 30,
-                show_spinner="업종 정보 색인을 만드는 중입니다 (상장사 전체 조회, 처음 1회만 1~2분 정도 걸려요)...")
-def build_industry_index(api_key: str, corp_map: dict) -> dict:
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def build_industry_index(api_key: str, corp_map: dict, time_budget_sec: int = 90) -> dict:
     """DART Open API엔 '업종별 회사 목록' 조회가 따로 없어서, 상장사 전체의 company.json을
     한 번 훑어 corp_code -> (corp_name, induty_code) 색인을 직접 만든다.
-    결과는 30일간 캐시되므로, 이후 요청부터는 즉시 조회된다."""
+    결과는 30일간 캐시되므로, 이후 요청부터는 즉시 조회된다.
+
+    주의: 이전 버전은 ThreadPoolExecutor.map()을 써서, 먼저 제출된 요청 하나가 느려지면
+    뒤에 이미 끝난 결과까지 전부 막혀서 기다리는(head-of-line blocking) 문제가 있었다.
+    as_completed()로 끝나는 대로 바로 처리하고, 시간 예산(기본 90초)을 넘기면 그때까지
+    모은 결과만으로 진행한다 — 무한정 기다리지 않는다."""
 
     def fetch_one(name_code):
         name, code = name_code
         try:
             resp = requests.get(f"{BASE_URL}/company.json",
-                                 params={"crtfc_key": api_key, "corp_code": code}, timeout=10)
+                                 params={"crtfc_key": api_key, "corp_code": code}, timeout=4)
             data = resp.json()
             if data.get("status") == "000" and data.get("induty_code"):
                 return code, name, data.get("induty_code")
@@ -279,12 +284,35 @@ def build_industry_index(api_key: str, corp_map: dict) -> dict:
             pass
         return code, name, None
 
-    index = {}
     items = list(corp_map.items())
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        for code, name, induty in ex.map(fetch_one, items):
-            if induty:
-                index[code] = (name, induty)
+    index = {}
+    progress = st.progress(0.0, text=f"업종 정보 색인 생성 중... (0/{len(items)}건, 처음 1회만 필요해요)")
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+    futures = {ex.submit(fetch_one, item): item for item in items}
+    start = time.monotonic()
+    done = 0
+    try:
+        for fut in concurrent.futures.as_completed(futures):
+            done += 1
+            try:
+                code, name, induty = fut.result()
+                if induty:
+                    index[code] = (name, induty)
+            except Exception:
+                pass
+            elapsed = time.monotonic() - start
+            if done % 20 == 0 or done == len(items):
+                progress.progress(min(done / len(items), 1.0),
+                                   text=f"업종 정보 색인 생성 중... ({done}/{len(items)}건, {elapsed:.0f}초 경과)")
+            if elapsed > time_budget_sec:
+                break
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+        progress.empty()
+
+    if len(index) < len(items):
+        st.caption(f"⏱ 시간 제한으로 상장사 {len(items)}곳 중 {len(index)}곳까지만 색인했습니다. "
+                    f"동종업계가 안 잡히면 잠시 후 다시 시도하면 캐시가 이어서 채워질 수 있어요.")
     return index
 
 
