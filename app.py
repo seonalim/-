@@ -65,20 +65,31 @@ def get_api_key():
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner="기업 코드 목록 불러오는 중...")
-def load_corp_code_map(api_key: str) -> dict:
+def load_corp_code_map(api_key: str):
+    """DART에 등록된 모든 회사(corp_name -> corp_code)를 돌려준다.
+
+    이전 버전은 상장사(stock_code가 있는 회사)만 포함했는데, 신한카드·롯데카드처럼
+    금융지주·그룹의 100% 자회사라 증권시장에 따로 상장돼 있지 않지만 사채 발행 등으로
+    DART에 사업보고서를 내는 회사들이 통째로 빠지는 문제가 있었다. 그래서 이제는
+    상장 여부와 무관하게 이름이 있는 모든 회사를 corp_map에 담고, 상장사 목록은
+    별도 set(listed_codes)로 같이 돌려준다 — 업종 자동탐색처럼 "상장사만" 필요한
+    기능에서는 이 listed_codes로 범위를 좁혀 쓰면 된다."""
     resp = requests.get(f"{BASE_URL}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
     resp.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         xml_bytes = zf.read(zf.namelist()[0])
     root = ET.fromstring(xml_bytes)
     name_to_code = {}
+    listed_codes = set()
     for item in root.findall("list"):
         corp_name = (item.findtext("corp_name") or "").strip()
         corp_code = (item.findtext("corp_code") or "").strip()
         stock_code = (item.findtext("stock_code") or "").strip()
-        if corp_name and corp_code and stock_code:
+        if corp_name and corp_code:
             name_to_code[corp_name] = corp_code
-    return name_to_code
+            if stock_code:
+                listed_codes.add(corp_code)
+    return name_to_code, listed_codes
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -251,12 +262,15 @@ def resolve_company(user_input: str, corp_map: dict, norm_index: dict):
         official = norm_index[best_norm]
         return official, corp_map[official], f"부분 일치 (정식명: {official})"
 
-    # 3) 유사도 기반 퍼지 매칭 (오타·줄임말 등)
-    close = difflib.get_close_matches(norm_input, list(norm_index.keys()), n=1, cutoff=0.6)
+    # 3) 유사도 기반 퍼지 매칭 (오타 등). "리드" vs "우리카드"처럼 짧은 이름끼리
+    #    우연히 글자가 겹쳐 엉뚱하게 매칭되는 걸 막기 위해, 기준을 0.75로 올리고
+    #    길이가 너무 차이 나는 후보는 애초에 제외한다.
+    length_ok = [n for n in norm_index if min(len(n), len(norm_input)) / max(len(n), len(norm_input), 1) >= 0.6]
+    close = difflib.get_close_matches(norm_input, length_ok, n=1, cutoff=0.75)
     if close:
         official = norm_index[close[0]]
         score = difflib.SequenceMatcher(None, norm_input, close[0]).ratio()
-        return official, corp_map[official], f"유사 매칭, 유사도 {score:.0%} (정식명: {official})"
+        return official, corp_map[official], f"유사 매칭, 유사도 {score:.0%} (정식명: {official}) — 잘못 매칭된 것 같으면 정확한 명칭으로 다시 입력해주세요"
 
     return None, None, None
 
@@ -316,15 +330,30 @@ def build_industry_index(api_key: str, corp_map: dict, time_budget_sec: int = 90
     return index
 
 
-def find_industry_peers(target_corp_code: str, industry_index: dict, max_peers: int = 4):
-    """같은 업종코드(표준산업분류)를 쓰는 다른 상장사들을 찾는다."""
-    entry = industry_index.get(target_corp_code)
-    if not entry:
-        return None, []
-    _, induty_code = entry
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def fetch_induty_code(api_key: str, corp_code: str):
+    """대상 회사 1곳의 업종코드만 조회한다 (상장 여부와 무관하게 동작 — 신한카드처럼
+    비상장이라 industry_index 스캔 대상에 없는 회사도 자기 업종코드는 알아낼 수 있다)."""
+    try:
+        resp = requests.get(f"{BASE_URL}/company.json",
+                             params={"crtfc_key": api_key, "corp_code": corp_code}, timeout=10)
+        data = resp.json()
+        if data.get("status") == "000":
+            return data.get("induty_code")
+    except Exception:
+        pass
+    return None
+
+
+def find_industry_peers(induty_code: str, industry_index: dict, exclude_code: str, max_peers: int = 4):
+    """같은 업종코드(표준산업분류)를 쓰는 다른 '상장' 회사들을 찾는다.
+    industry_index는 상장사만 스캔해 만들어지므로, 대상 회사 자신이 비상장이어도
+    (예: 신한카드) 업종코드만 알면 상장된 동종업계를 찾을 수 있다."""
+    if not induty_code:
+        return []
     peers = [name for code, (name, ind) in industry_index.items()
-             if ind == induty_code and code != target_corp_code]
-    return induty_code, sorted(peers)[:max_peers]
+             if ind == induty_code and code != exclude_code]
+    return sorted(peers)[:max_peers]
 
 
 def flag_outliers(df: pd.DataFrame, value_col="ratio", z_threshold=1.5):
@@ -384,7 +413,7 @@ if run:
         st.stop()
 
     try:
-        corp_map = load_corp_code_map(api_key)
+        corp_map, listed_codes = load_corp_code_map(api_key)
     except Exception as e:
         st.error(f"기업 코드 목록을 불러오지 못했습니다: {e}")
         st.stop()
@@ -404,20 +433,38 @@ if run:
         if not target_code:
             st.error(f"'{single_company}'와(과) 비슷한 회사를 DART에서 찾지 못했습니다. 표기를 확인해주세요.")
             st.stop()
+        if target_official != single_company.strip():
+            st.caption(f"🔎 '{single_company}' → '{target_official}'로 인식했습니다 ({target_match_type}).")
 
-        industry_index = build_industry_index(api_key, corp_map)
-        induty_code, peer_names = find_industry_peers(target_code, industry_index, max_peers=max_peers)
-
+        # 대상 회사의 업종코드는 상장 여부와 무관하게 조회 가능 (신한카드·롯데카드 같은
+        # 비상장 카드사도 자기 업종코드는 알아낼 수 있음)
+        induty_code = fetch_induty_code(api_key, target_code)
         if not induty_code:
-            st.warning(f"'{target_official}'의 업종코드 정보를 찾지 못해 동종업계 자동 탐색을 할 수 없습니다. "
-                       f"직접 입력 방식으로 비교해주세요.")
+            st.warning(f"'{target_official}'의 업종코드 정보를 DART에서 찾지 못해 동종업계 자동 탐색을 할 수 없습니다. "
+                       f"'여러 회사 직접 입력' 방식으로 비교해주세요.")
             st.stop()
+
+        # 동종업계 스캔(업종 색인)은 시간이 걸리므로 "상장사"로만 범위를 좁힌다.
+        listed_corp_map = {name: code for name, code in corp_map.items() if code in listed_codes}
+        industry_index = build_industry_index(api_key, listed_corp_map)
+        peer_names = find_industry_peers(induty_code, industry_index, exclude_code=target_code, max_peers=max_peers)
+
         if not peer_names:
-            st.warning(f"'{target_official}'과(와) 같은 업종코드({induty_code})의 다른 상장사를 찾지 못했습니다.")
+            is_target_listed = target_code in listed_codes
+            extra = (
+                "이 회사 자체가 비상장이고, 신용카드사처럼 같은 업종의 다른 회사들도 대부분 금융지주의 "
+                "비상장 자회사라 '상장사 기준' 자동 탐색 범위에는 동종업계가 안 잡히는 경우가 많아요. "
+                if not is_target_listed else
+                "시간 제한 때문에 상장사 전체를 다 훑지 못했을 수도 있어요. 다시 실행하면 캐시가 이어서 채워질 수 있습니다. "
+            )
+            st.warning(f"'{target_official}'과(와) 같은 업종코드({induty_code})의 다른 상장사를 찾지 못했습니다. "
+                       + extra +
+                       "이런 경우 '여러 회사 직접 입력' 모드에서 비교하고 싶은 회사명을 직접 나열해주세요 "
+                       "(예: 신한카드, 삼성카드, KB국민카드, 하나카드, 우리카드, 롯데카드).")
             st.stop()
 
         companies = [target_official] + peer_names
-        st.caption(f"🔍 '{target_official}' 기준 업종코드 {induty_code}의 동종업계 {len(peer_names)}곳을 찾았습니다: "
+        st.caption(f"🔍 '{target_official}' 기준 업종코드 {induty_code}의 동종업계(상장사) {len(peer_names)}곳을 찾았습니다: "
                    + ", ".join(peer_names))
 
     years = [str(int(base_year) - i) for i in range(n_years)]  # 예: 2025,2024,2023
